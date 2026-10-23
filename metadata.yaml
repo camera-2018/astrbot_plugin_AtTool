@@ -4,6 +4,6 @@ desc: "OneBot 群成员查询与真实 @；固定系统提示，按操作者权�
 version: v3.0.0
 author: "camera-2018（原作者：糯米茨及贡献者）"
 repo: https://github.com/camera-2018/astrbot_plugin_AtTool
-astrbot_version: ">=4.24,<5"
+astrbot_version: ">=4.29.1,<5"
 support_platforms:
   - aiocqhttp
