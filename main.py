@@ -18,19 +18,41 @@ from astrbot.core.platform.sources.aiocqhttp.aiocqhttp_message_event import (
 )
 
 if __package__:
-    from .qq_official import KnownMembers, OUTGOING, QQOfficialCompat, convert_text
+    from .qq_official import (
+        KnownMembers,
+        OUTGOING,
+        QQOfficialCompat,
+        convert_text,
+        mention_target,
+    )
 else:  # Standalone SDK tests.
-    from qq_official import KnownMembers, OUTGOING, QQOfficialCompat, convert_text
+    from qq_official import (
+        KnownMembers,
+        OUTGOING,
+        QQOfficialCompat,
+        convert_text,
+        mention_target,
+    )
 
 
 AT_INSTRUCTION = (
     "\n【群聊 @ 用法】\n"
-    "提及群成员时输出 [at:成员ID]，程序会转换为真正的 @。"
-    "OneBot 使用 QQ号；QQ 官方机器人使用 member_openid，二者不能替换或互相推算。"
-    "只使用当前会话中已确认或 get_group_members 查到的成员ID；不确定时先查询，禁止编造。"
-    "官方平台查询返回本群已见成员，不代表全员名单；查不到时不要猜ID。\n"
+    "提及群成员时输出 [at:QQ号]，程序会转换为真正的 @。"
+    "只使用当前会话中已确认或 get_group_members 查到的 QQ号；不确定时先查询，禁止编造。\n"
     "只有用户明确要求、确有通知必要且本轮权限允许时，才可输出 [at:all]。"
     "本轮权限不允许时用自然语言说明，发送前程序仍会校验。\n"
+)
+OFFICIAL_AT_INSTRUCTION = (
+    "\n【QQ 官方群聊 @ 用法】\n"
+    "需要真正 @ 群成员时，调用内置 send_message_to_user 工具，messages 中加入 "
+    '{"type":"mention_user","mention_user_id":"已确认的member_openid"}，'
+    '并把正文作为 {"type":"plain","text":"回复正文"} 放在同一次调用中。'
+    "当前群的 session 参数留空。发送成功后不要重复输出已发送的正文。"
+    "普通不需要 @ 的聊天直接回复即可。\n"
+    "成员ID必须使用本群已确认的 member_openid，不要使用或猜测普通QQ号。"
+    "不确定目标时先用 get_group_members 查询；官方平台只返回本群已见成员，不代表全员名单。"
+    "只有用户明确要求、确有通知必要且本轮权限允许时，才可通过 mention_user_id=all 请求 @全体。"
+    "本轮不允许时用自然语言说明，发送前程序仍会校验。\n"
 )
 AT_PATTERN = re.compile(r"\[at:([0-9]+|all)\]", re.ASCII)
 
@@ -67,7 +89,7 @@ class LLMAtToolPlugin(Star):
 
     async def initialize(self):
         self.qq_compat.install()
-        self.logger.info("@工具 v3.1.0：QQ 官方入站 @ 和图文发送兼容已启用")
+        self.logger.info("@工具 v3.1.1：OneBot 使用标签，QQ 官方使用内置发送工具")
 
     async def terminate(self):
         self.qq_compat.uninstall()
@@ -126,15 +148,61 @@ class LLMAtToolPlugin(Star):
             return
         if self._official(event):
             self.members.observe(event)
-        # The same bytes are added for every sender and permission outcome.
-        req.system_prompt = (req.system_prompt or "") + AT_INSTRUCTION
+        # Each platform has a fixed prefix, independent of sender/permissions.
+        official = self._official(event)
+        req.system_prompt = (req.system_prompt or "") + (
+            OFFICIAL_AT_INSTRUCTION if official else AT_INSTRUCTION
+        )
         allowed, reason = await self._at_all_permission(event)
         status = "允许" if allowed else "禁止"
+        action = '@全体（mention_user_id="all"）' if official else "[at:all]"
         req.extra_user_content_parts.append(
             TextPart(
-                text=f"【本轮 @ 权限】{status}使用 [at:all]。原因：{reason}。"
+                text=f"【本轮 @ 权限】{status}使用 {action}。原因：{reason}。"
             ).mark_as_temp()
         )
+
+    @filter.on_using_llm_tool()
+    async def guard_official_tool(self, event, tool, tool_args) -> None:
+        """Native sends bypass result decoration; retain the existing @all policy."""
+        if (
+            not self._official(event)
+            or getattr(tool, "name", "") != "send_message_to_user"
+            or not isinstance(tool_args, dict)
+        ):
+            return
+        messages = tool_args.get("messages")
+        if not isinstance(messages, list):
+            return
+
+        def targets_all(message):
+            if not isinstance(message, dict):
+                return False
+            kind = str(message.get("type", "")).lower()
+            if kind == "mention_user":
+                return message.get("mention_user_id") == "all"
+            return kind == "plain" and any(
+                mention_target(match) == "all"
+                for match in OUTGOING.finditer(str(message.get("text", "")))
+            )
+
+        if not any(targets_all(message) for message in messages):
+            return
+        allowed, _ = await self._at_all_permission(event)
+        if allowed:
+            return
+        for index, message in enumerate(messages):
+            if not targets_all(message):
+                continue
+            if str(message.get("type", "")).lower() == "mention_user":
+                messages[index] = {"type": "plain", "text": "@全体成员"}
+            else:
+                message["text"] = OUTGOING.sub(
+                    lambda match: "@全体成员"
+                    if mention_target(match) == "all"
+                    else match.group(),
+                    str(message.get("text", "")),
+                )
 
     @filter.llm_tool(name="get_group_members")
     async def get_group_members(

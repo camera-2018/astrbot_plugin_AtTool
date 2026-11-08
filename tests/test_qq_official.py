@@ -1,6 +1,7 @@
 """Run the real QQ adapter with mocked upload/send endpoints, never a live QQ call."""
 
 import json
+import copy
 import unittest
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
@@ -19,6 +20,7 @@ from astrbot.core.platform.sources.qqofficial.qqofficial_platform_adapter import
     QQOfficialPlatformAdapter,
     botpy,
 )
+from astrbot.core.tools.message_tools import SendMessageToUserTool
 
 from main import LLMAtToolPlugin
 from qq_official import KnownMembers, QQOfficialCompat, group_chunks
@@ -194,8 +196,102 @@ class OfficialTests(unittest.IsolatedAsyncioTestCase):
             assembled = await req.assemble_context()
             self.assertTrue(assembled["content"][-1]["_no_save"])
         self.assertEqual(requests[0].system_prompt, requests[1].system_prompt)
+        self.assertIn("send_message_to_user", requests[0].system_prompt)
+        self.assertIn("mention_user_id", requests[0].system_prompt)
+        self.assertNotIn("[at:", requests[0].system_prompt)
+        self.assertNotIn("[at:", requests[0].extra_user_content_parts[-1].text)
         self.assertIn("禁止", requests[0].extra_user_content_parts[-1].text)
         self.assertIn("允许", requests[1].extra_user_content_parts[-1].text)
+
+    async def test_onebot_prompt_keeps_tag_route(self):
+        from test_attool import Event
+
+        req = ProviderRequest(system_prompt="固定人格")
+        await self.plugin.inject_at_instruction(Event(), req)
+        self.assertIn("[at:QQ号]", req.system_prompt)
+        self.assertNotIn("send_message_to_user", req.system_prompt)
+
+    async def _call_native_sender(self, event, args):
+        adapter = object.__new__(QQOfficialPlatformAdapter)
+        adapter._session_last_message_id = {GROUP: "cached-message"}
+        adapter._session_scene = {GROUP: "group"}
+        adapter._allow_group_proactive_send = True
+        adapter.use_markdown_default = False
+        adapter.client = event.bot
+
+        async def deliver(session, chain):
+            await adapter.send_by_session(session, chain)
+            return True
+
+        context = SimpleNamespace(
+            context=SimpleNamespace(
+                event=event, context=SimpleNamespace(send_message=deliver)
+            )
+        )
+        tool = SendMessageToUserTool()
+        await self.plugin.guard_official_tool(event, tool, args)
+        with patch.object(Platform, "send_by_session", AsyncMock()):
+            return await tool.call(context, **args)
+
+    async def test_native_sender_openid_reaches_real_adapter_once(self):
+        event = await make_event()
+        args = {
+            "messages": [
+                {"type": "mention_user", "mention_user_id": BOB},
+                {"type": "plain", "text": "上线聊聊"},
+            ]
+        }
+        result = await self._call_native_sender(event, args)
+        self.assertIn("Message sent", result)
+        event.bot.api.post_group_message.assert_awaited_once()
+        payload = event.bot.api.post_group_message.await_args.kwargs
+        self.assertEqual(payload["msg_type"], 2)
+        self.assertEqual(
+            payload["markdown"]["content"], f'<qqbot-at-user id="{BOB}" />上线聊聊'
+        )
+        self.assertTrue(event._has_send_oper)
+        self.assertEqual(
+            event.get_extra("_send_message_to_user_current_session_plain_texts"),
+            ["上线聊聊"],
+        )
+
+    async def test_native_sender_preserves_at_all_policy(self):
+        for admin in (False, True):
+            with self.subTest(admin=admin):
+                event = await make_event(admin=admin)
+                args = {
+                    "messages": [
+                        {"type": "mention_user", "mention_user_id": "all"},
+                        {"type": "plain", "text": "通知"},
+                    ]
+                }
+                await self._call_native_sender(event, args)
+                payload = event.bot.api.post_group_message.await_args.kwargs
+                text = (payload.get("markdown") or {}).get("content") or payload.get(
+                    "content"
+                )
+                self.assertEqual("<qqbot-at-everyone />" in text, admin)
+
+    async def test_native_guard_handles_raw_all_and_leaves_other_calls_unchanged(self):
+        event = await make_event()
+        args = {
+            "messages": [
+                {"type": "plain", "text": f"<qqbot-at-everyone /> 通知<@{BOB}>"}
+            ]
+        }
+        await self.plugin.guard_official_tool(event, SendMessageToUserTool(), args)
+        self.assertEqual(args["messages"][0]["text"], f"@全体成员 通知<@{BOB}>")
+        for target_event, tool in [
+            (
+                SimpleNamespace(platform_meta=SimpleNamespace(name="aiocqhttp")),
+                SendMessageToUserTool(),
+            ),
+            (event, SimpleNamespace(name="other_tool")),
+        ]:
+            args = {"messages": [{"type": "mention_user", "mention_user_id": "all"}]}
+            before = copy.deepcopy(args)
+            await self.plugin.guard_official_tool(target_event, tool, args)
+            self.assertEqual(args, before)
 
     async def test_official_at_all_requires_bot_admin_including_raw_markup(self):
         for part in [
