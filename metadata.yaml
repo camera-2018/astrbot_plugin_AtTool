@@ -1,9 +1,11 @@
 name: astrbot_plugin_AtTool
 display_name: "@工具 · 精简版"
-desc: "OneBot 群成员查询与真实 @；固定系统提示，按操作者权限校验 @全体"
-version: v3.0.0
+desc: "OneBot 与 QQ 官方群聊 @、成员查询及图文兼容；固定系统提示，校验 @全体权限"
+version: v3.1.0
 author: "camera-2018（原作者：糯米茨及贡献者）"
 repo: https://github.com/camera-2018/astrbot_plugin_AtTool
-astrbot_version: ">=4.29.1,<5"
+astrbot_version: ">=4.29.4,<5"
 support_platforms:
   - aiocqhttp
+  - qq_official
+  - qq_official_webhook
